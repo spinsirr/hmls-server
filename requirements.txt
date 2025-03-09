@@ -8,4 +8,10 @@ passlib[bcrypt]
 python-multipart
 python-dotenv
 psycopg2-binary
-pytz 
+pytz
+redis==5.0.1
+fastapi-limiter==0.1.5
+aioredis==2.0.1
+asyncpg==0.29.0
+sqlalchemy[asyncio]
+alembic==1.13.1 
