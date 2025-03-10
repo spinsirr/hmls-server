@@ -264,7 +264,7 @@ async def test_appointments_pressure(async_client: AsyncClient, auth_headers: di
     for i in range(100):
         # Add a small stagger between task creation
         if i > 0 and i % 10 == 0:  # Every 10 tasks
-            await asyncio.sleep(0.1)  # Add a small delay
+            await asyncio.sleep(0.001)  # Reduced delay to 1ms
         tasks.append(get_appointments_with_retry())
     responses = await asyncio.gather(*tasks, return_exceptions=True)
     
