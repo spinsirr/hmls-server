@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     CACHE_EXPIRE_SECONDS: int = 300
     
     # Connection pool settings
-    DB_POOL_SIZE: int = 20
-    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_SIZE: int = 20  # Pool size set to 20
+    DB_MAX_OVERFLOW: int = 10  # Max overflow set to 10
     DB_POOL_TIMEOUT: int = 30
     DB_POOL_RECYCLE: int = 1800
     

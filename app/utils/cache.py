@@ -1,24 +1,25 @@
 import redis.asyncio as redis
 from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
 from ..utils.config import get_settings
+import json
 
 settings = get_settings()
 
 # Redis connection pool
 redis_pool = redis.ConnectionPool.from_url(
     settings.REDIS_URL,
-    max_connections=20,
-    decode_responses=True
+    max_connections=settings.REDIS_POOL_SIZE * 2,  # Double the pool size for high concurrency
+    decode_responses=True,
+    health_check_interval=30,  # Add health check
+    socket_timeout=5,  # Add socket timeout
+    socket_connect_timeout=5  # Add connect timeout
 )
 
 # Redis client
-redis_client = redis.Redis(connection_pool=redis_pool)
-
-# Rate limiter configuration
-rate_limiter = RateLimiter(
-    times=100,  # Number of requests
-    seconds=60  # Time window in seconds
+redis_client = redis.Redis(
+    connection_pool=redis_pool,
+    socket_keepalive=True,  # Enable keepalive
+    retry_on_timeout=True   # Retry on timeout
 )
 
 async def init_redis():
@@ -37,7 +38,6 @@ async def clear_cached_data(key: str):
     """Clear data from Redis cache"""
     await redis_client.delete(key)
 
-# Cache decorator
 def cache_response(expire: int = 300):
     """Decorator to cache API responses"""
     def decorator(func):
@@ -48,11 +48,11 @@ def cache_response(expire: int = 300):
             # Try to get from cache
             cached_result = await get_cached_data(cache_key)
             if cached_result:
-                return cached_result
+                return json.loads(cached_result)
             
             # If not in cache, execute function and cache result
             result = await func(*args, **kwargs)
-            await set_cached_data(cache_key, result, expire)
+            await set_cached_data(cache_key, json.dumps(result), expire)
             return result
         return wrapper
     return decorator 

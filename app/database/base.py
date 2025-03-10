@@ -14,10 +14,11 @@ ASYNC_DATABASE_URL = settings.DATABASE_URL.replace(
 engine = create_async_engine(
     ASYNC_DATABASE_URL,
     echo=True,
-    pool_size=20,  # Maximum number of database connections in the pool
-    max_overflow=10,  # Maximum number of connections that can be created beyond pool_size
+    pool_size=20,  # Pool size set to 20
+    max_overflow=10,  # Max overflow set to 10
     pool_timeout=30,  # Timeout for getting a connection from the pool
     pool_recycle=1800,  # Recycle connections after 30 minutes
+    pool_pre_ping=True  # Enable connection health checks
 )
 
 # Create async session factory
