@@ -5,122 +5,132 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import redis
 import contextlib
+from typing import List
+import logging
 
 from ..database.base import AsyncSessionLocal, engine
 from ..models.appointment import Appointment
 from ..utils.queue import AppointmentQueue
 from ..utils.cache import redis_client, clear_cached_data
+from ..utils.config import get_settings
 
+settings = get_settings()
 appointment_queue = AppointmentQueue(redis_client)
 
-async def is_time_slot_available(session: AsyncSession, appointment_time: datetime) -> bool:
-    """Check if the appointment time slot is available"""
-    query = select(Appointment).where(
-        Appointment.appointment_time == appointment_time,
-        Appointment.status != "cancelled"
-    )
-    result = await session.execute(query)
-    return result.scalar_one_or_none() is None
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def process_appointment_request(appointment_data: dict) -> dict:
-    """Process a single appointment request"""
+async def is_time_slot_available(session: AsyncSession, appointment_time: datetime) -> bool:
+    """Check if the appointment time slot is available with error handling"""
     try:
-        # Convert appointment time string to datetime if it's not already a datetime
-        if isinstance(appointment_data["appointment_time"], str):
-            appointment_time = datetime.fromisoformat(appointment_data["appointment_time"])
-        else:
-            appointment_time = appointment_data["appointment_time"]
-        
-        # Validate appointment time is in the future
-        if appointment_time <= datetime.now(pytz.UTC):
-            return {"success": False, "error": "Appointment time must be in the future"}
-        
-        async with AsyncSessionLocal() as session:
-            try:
-                # Get existing appointment if ID is provided
-                appointment_id = appointment_data.get("id")
-                if appointment_id:
+        query = select(Appointment).where(
+            Appointment.appointment_time == appointment_time,
+            Appointment.status != "cancelled"
+        )
+        result = await session.execute(query)
+        return result.scalar_one_or_none() is None
+    except Exception as e:
+        logger.error(f"Error checking time slot availability: {e}")
+        raise
+
+async def process_appointments_batch(appointments: List[dict]) -> List[dict]:
+    """Process a batch of appointments concurrently"""
+    async def process_single(appointment_data: dict) -> dict:
+        try:
+            if isinstance(appointment_data["appointment_time"], str):
+                appointment_time = datetime.fromisoformat(appointment_data["appointment_time"])
+            else:
+                appointment_time = appointment_data["appointment_time"]
+            
+            if appointment_time <= datetime.now(pytz.UTC):
+                return {"id": appointment_data.get("id"), "success": False, "error": "Appointment time must be in the future"}
+            
+            async with AsyncSessionLocal() as session:
+                try:
+                    appointment_id = appointment_data.get("id")
+                    if not appointment_id:
+                        return {"success": False, "error": "Appointment ID not provided"}
+                    
                     query = select(Appointment).where(Appointment.id == appointment_id)
                     result = await session.execute(query)
                     db_appointment = result.scalar_one_or_none()
                     
                     if not db_appointment:
-                        return {"success": False, "error": "Appointment not found"}
+                        return {"id": appointment_id, "success": False, "error": "Appointment not found"}
                     
-                    # Check if time slot is available (excluding this appointment)
-                    query = select(Appointment).where(
-                        Appointment.appointment_time == appointment_time,
-                        Appointment.status != "cancelled",
-                        Appointment.id != appointment_id
-                    )
-                    result = await session.execute(query)
-                    if result.scalar_one_or_none():
-                        return {"success": False, "error": "Time slot is not available"}
+                    # Check time slot availability
+                    if not await is_time_slot_available(session, appointment_time):
+                        return {"id": appointment_id, "success": False, "error": "Time slot is not available"}
                     
-                    # Update appointment status to confirmed
+                    # Update appointment
                     db_appointment.status = "confirmed"
                     await session.commit()
-                    await session.refresh(db_appointment)
-                    
-                    return {"success": True, "id": db_appointment.id}
-                
-                # For new appointments (should not happen anymore as we create them in the endpoint)
-                return {"success": False, "error": "Appointment ID not provided"}
-            except Exception as e:
-                await session.rollback()
-                raise e
-            finally:
-                await session.close()
-    except Exception as e:
-        print(f"Error processing appointment: {e}")
-        return {"success": False, "error": str(e)}
+                    return {"id": appointment_id, "success": True}
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(f"Database error processing appointment {appointment_id}: {e}")
+                    return {"id": appointment_id, "success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error processing appointment: {e}")
+            return {"id": appointment_data.get("id"), "success": False, "error": str(e)}
+
+    return await asyncio.gather(*[process_single(appt) for appt in appointments])
 
 async def appointment_worker():
-    """Background worker to process appointment requests"""
+    """Background worker to process appointment requests with improved concurrency"""
     cleanup_interval = 300  # Cleanup every 5 minutes
     last_cleanup = datetime.now()
+    batch_size = settings.WORKER_PREFETCH_COUNT
     
     while True:
         try:
-            # Periodic connection cleanup
+            # Periodic cleanup
             if (datetime.now() - last_cleanup).seconds >= cleanup_interval:
                 await engine.dispose()
                 last_cleanup = datetime.now()
-                print("Performed periodic connection cleanup")
+                logger.info("Performed periodic connection cleanup")
             
-            # Get next appointment request from queue
-            appointment_data = await appointment_queue.dequeue_appointment()
-            if appointment_data:
-                # Process the appointment request
-                result = await process_appointment_request(appointment_data)
+            # Get batch of appointments
+            appointments = []
+            for _ in range(batch_size):
+                appointment_data = await appointment_queue.dequeue_appointment()
+                if appointment_data:
+                    appointments.append(appointment_data)
+                else:
+                    break
+            
+            if not appointments:
+                await asyncio.sleep(1)
+                continue
+            
+            # Process batch
+            results = await process_appointments_batch(appointments)
+            
+            # Handle results
+            for appointment_data, result in zip(appointments, results):
                 if result["success"]:
-                    # Remove from processing list if successful
                     await appointment_queue.complete_processing(appointment_data)
                 else:
-                    # Log error and requeue failed requests
-                    print(f"Failed to process appointment: {result.get('error', 'Unknown error')}")
+                    logger.error(f"Failed to process appointment: {result.get('error', 'Unknown error')}")
                     await appointment_queue.requeue_failed()
-            else:
-                # No requests to process, wait a bit
-                await asyncio.sleep(1)
+        
         except redis.RedisError as e:
-            print(f"Redis error in worker: {e}")
-            await asyncio.sleep(5)  # Wait longer on Redis errors
-            # Try to requeue any failed items
+            logger.error(f"Redis error in worker: {e}")
+            await asyncio.sleep(5)
             try:
                 await appointment_queue.requeue_failed()
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Error requeuing failed appointments: {e}")
+        
         except Exception as e:
-            print(f"Worker error: {e}")
+            logger.error(f"Worker error: {e}")
             await asyncio.sleep(1)
-        finally:
-            # Ensure we don't accumulate connections
-            if 'session' in locals():
-                await session.close()
 
-# Function to start the worker
 async def start_appointment_worker():
-    """Start the appointment processing worker"""
-    worker_task = asyncio.create_task(appointment_worker())
-    return worker_task 
+    """Start multiple appointment processing workers"""
+    worker_tasks = []
+    for _ in range(settings.WORKER_CONCURRENCY):
+        worker_task = asyncio.create_task(appointment_worker())
+        worker_tasks.append(worker_task)
+    return worker_tasks 
